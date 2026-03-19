@@ -260,6 +260,40 @@ describe("GitHubProvider.getPrStatus — closed PR handling", () => {
   });
 });
 
+describe("GitHubProvider.getPrStatusByUrl", () => {
+  it("looks up an open PR directly by URL", async () => {
+    const provider = new GitHubProvider({ repoPath: "/fake", runCommand: mockRunCommand });
+    const prUrl = "https://github.com/owner/repo/pull/133";
+
+    (provider as any).gh = async () => JSON.stringify({
+      number: 133,
+      title: "feat: keep existing PR",
+      url: prUrl,
+      headRefName: "feature/130-replace-hardcoded-colors",
+      reviewDecision: "",
+      mergeable: "MERGEABLE",
+      state: "OPEN",
+    });
+    (provider as any).hasChangesRequestedReview = async () => false;
+    (provider as any).hasUnacknowledgedReviews = async () => false;
+    (provider as any).hasConversationComments = async () => false;
+
+    const status = await provider.getPrStatusByUrl(prUrl);
+
+    assert.ok(status);
+    assert.strictEqual(status?.state, PrState.OPEN);
+    assert.strictEqual(status?.url, prUrl);
+    assert.strictEqual(status?.sourceBranch, "feature/130-replace-hardcoded-colors");
+    assert.strictEqual(status?.mergeable, true);
+  });
+
+  it("returns null for malformed PR URLs", async () => {
+    const provider = new GitHubProvider({ repoPath: "/fake", runCommand: mockRunCommand });
+    const status = await provider.getPrStatusByUrl("https://github.com/owner/repo/issues/42");
+    assert.strictEqual(status, null);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // GitLab provider tests
 // ---------------------------------------------------------------------------
@@ -354,5 +388,39 @@ describe("GitLabProvider.getPrStatus — closed MR handling", () => {
     assert.strictEqual(status.state, PrState.CLOSED);
     // First closed MR found is returned
     assert.strictEqual(status.url, closedMrUrl1);
+  });
+});
+
+describe("GitLabProvider.getPrStatusByUrl", () => {
+  it("looks up an open MR directly by URL", async () => {
+    const provider = new GitLabProvider({ repoPath: "/fake", runCommand: mockRunCommand });
+    const mrUrl = "https://gitlab.com/owner/repo/-/merge_requests/17";
+
+    (provider as any).glab = async () => JSON.stringify({
+      iid: 17,
+      title: "fix: update existing MR",
+      web_url: mrUrl,
+      state: "opened",
+      source_branch: "feature/130-replace-hardcoded-colors",
+      merged_at: null,
+    });
+    (provider as any).isMrApproved = async () => false;
+    (provider as any).hasUnresolvedDiscussions = async () => false;
+    (provider as any).hasConversationComments = async () => false;
+    (provider as any).isMrMergeable = async () => true;
+
+    const status = await provider.getPrStatusByUrl(mrUrl);
+
+    assert.ok(status);
+    assert.strictEqual(status?.state, PrState.OPEN);
+    assert.strictEqual(status?.url, mrUrl);
+    assert.strictEqual(status?.sourceBranch, "feature/130-replace-hardcoded-colors");
+    assert.strictEqual(status?.mergeable, true);
+  });
+
+  it("returns null for malformed MR URLs", async () => {
+    const provider = new GitLabProvider({ repoPath: "/fake", runCommand: mockRunCommand });
+    const status = await provider.getPrStatusByUrl("https://gitlab.com/owner/repo/-/issues/42");
+    assert.strictEqual(status, null);
   });
 });

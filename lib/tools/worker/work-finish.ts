@@ -12,7 +12,8 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { ToolContext } from "../../types.js";
 import type { PluginContext, RunCommand } from "../../context.js";
-import { getRoleWorker, resolveRepoPath, findSlotByIssue } from "../../projects/index.js";
+import type { IssueProvider, PrStatus } from "../../providers/provider.js";
+import { getRoleWorker, resolveRepoPath } from "../../projects/index.js";
 import { executeCompletion, getRule } from "../../services/pipeline.js";
 import { log as auditLog } from "../../audit.js";
 import { DATA_DIR } from "../../setup/migrate-layout.js";
@@ -31,40 +32,105 @@ async function getCurrentBranch(repoPath: string, runCommand: RunCommand): Promi
   return result.stdout.trim();
 }
 
+type ReviewAuditContext = {
+  feedbackPrUrl?: string;
+  isConflictResolutionCycle: boolean;
+};
 
-/**
- * Check if this work_finish is completing a conflict resolution cycle.
- * Returns true if the issue was recently transitioned to "To Improve" due to merge conflicts.
- * Used to gate mergeable-status validation — without this check, developers can claim
- * success after local rebase but before pushing, causing infinite dispatch loops (#482).
- */
-async function isConflictResolutionCycle(
+const FEEDBACK_PR_REASONS = new Set([
+  "changes_requested",
+  "pr_comments",
+  "merge_conflict",
+  "merge_failed",
+]);
+
+async function readReviewAuditContext(
   workspaceDir: string,
   issueId: number,
-): Promise<boolean> {
+): Promise<ReviewAuditContext> {
   const auditPath = join(workspaceDir, DATA_DIR, "log", "audit.log");
+  let feedbackPrUrl: string | undefined;
+  let isConflictResolutionCycle = false;
+
   try {
     const content = await readFile(auditPath, "utf-8");
     const lines = content.split("\n").filter(Boolean);
-    // Walk backwards through recent entries
+
     for (let i = lines.length - 1; i >= 0; i--) {
       try {
         const entry = JSON.parse(lines[i]!);
+        if (entry.issueId !== issueId || entry.event !== "review_transition") {
+          continue;
+        }
+
+        if (entry.reason === "merge_conflict") {
+          isConflictResolutionCycle = true;
+        }
+
         if (
-          entry.issueId === issueId &&
-          entry.event === "review_transition" &&
-          entry.reason === "merge_conflict"
+          !feedbackPrUrl &&
+          FEEDBACK_PR_REASONS.has(String(entry.reason)) &&
+          typeof entry.prUrl === "string" &&
+          entry.prUrl.length > 0
         ) {
-          return true;
+          feedbackPrUrl = entry.prUrl;
+        }
+
+        if (feedbackPrUrl && isConflictResolutionCycle) {
+          break;
         }
       } catch {
         // skip malformed lines
       }
     }
   } catch {
-    // If we can't read the audit log, fail open (assume not a conflict cycle)
+    // If we can't read the audit log, fail open.
   }
-  return false;
+
+  return { feedbackPrUrl, isConflictResolutionCycle };
+}
+
+export async function resolveDeveloperPrStatus(
+  issueId: number,
+  provider: IssueProvider,
+  workspaceDir: string,
+  explicitPrUrl?: string,
+): Promise<{
+  prStatus: PrStatus;
+  checkedFallbackPrUrl?: string;
+  fallbackSource?: "explicit" | "audit_feedback";
+  isConflictCycle: boolean;
+}> {
+  const auditContext = await readReviewAuditContext(workspaceDir, issueId);
+  const prStatus = await provider.getPrStatus(issueId);
+  if (prStatus.url) {
+    return { prStatus, isConflictCycle: auditContext.isConflictResolutionCycle };
+  }
+
+  const checkedFallbackPrUrl = explicitPrUrl ?? auditContext.feedbackPrUrl;
+  if (!checkedFallbackPrUrl) {
+    return {
+      prStatus,
+      checkedFallbackPrUrl,
+      isConflictCycle: auditContext.isConflictResolutionCycle,
+    };
+  }
+
+  const fallbackPrStatus = await provider.getPrStatusByUrl(checkedFallbackPrUrl);
+  if (!fallbackPrStatus?.url) {
+    return {
+      prStatus,
+      checkedFallbackPrUrl,
+      isConflictCycle: auditContext.isConflictResolutionCycle,
+    };
+  }
+
+  return {
+    prStatus: fallbackPrStatus,
+    checkedFallbackPrUrl,
+    fallbackSource: explicitPrUrl ? "explicit" : "audit_feedback",
+    isConflictCycle: auditContext.isConflictResolutionCycle,
+  };
 }
 
 /**
@@ -80,37 +146,58 @@ async function isConflictResolutionCycle(
 async function validatePrExistsForDeveloper(
   issueId: number,
   repoPath: string,
-  provider: Awaited<ReturnType<typeof resolveProvider>>["provider"],
+  provider: IssueProvider,
   runCommand: RunCommand,
   workspaceDir: string,
   projectSlug: string,
+  baseBranch: string,
+  explicitPrUrl?: string,
 ): Promise<void> {
   try {
-    const prStatus = await provider.getPrStatus(issueId);
+    const {
+      prStatus,
+      checkedFallbackPrUrl,
+      fallbackSource,
+      isConflictCycle,
+    } = await resolveDeveloperPrStatus(issueId, provider, workspaceDir, explicitPrUrl);
 
     // url is null when getPrStatus found no open or merged PR for this issue.
     // This covers both "no PR ever created" and "PR was closed without merging".
     if (!prStatus.url) {
-      // Get current branch for a helpful gh pr create example
-      let branchName = "current-branch";
+      // Best-effort branch hint for a helpful create-PR example.
+      let branchHint = "current-branch";
       try {
-        branchName = await getCurrentBranch(repoPath, runCommand);
+        branchHint = await getCurrentBranch(repoPath, runCommand);
       } catch {
         // Fall back to generic placeholder
       }
 
+      const fallbackLine = checkedFallbackPrUrl
+        ? `✗ Checked review-cycle PR URL: ${checkedFallbackPrUrl}\n`
+        : "";
+
       throw new Error(
         `Cannot mark work_finish(done) without an open PR.\n\n` +
-        `✗ No PR found for branch: ${branchName}\n\n` +
+        `✗ No PR linked to issue #${issueId}\n` +
+        fallbackLine +
+        `✗ Branch hint: ${branchHint}\n\n` +
         `Please create a PR first:\n` +
-        `  gh pr create --base main --head ${branchName} --title "..." --body "..."\n\n` +
+        `  gh pr create --base ${baseBranch} --head ${branchHint} --title "..." --body "..."\n\n` +
+        `If you are updating an existing review-cycle PR, pass its URL via work_finish({ ..., prUrl: "..." }).\n\n` +
         `Then call work_finish again.`,
       );
     }
 
-    // url is set — an open or merged PR exists and is linked to this issue.
-    // getPrStatus locates PRs via the issue tracker's linked-PR API, so any
-    // non-null url already implies the PR references the issue.
+    // url is set — an open or merged PR exists, either via the issue-linked
+    // lookup or the review-cycle URL fallback.
+    if (fallbackSource && checkedFallbackPrUrl) {
+      await auditLog(workspaceDir, "pr_validation_fallback", {
+        project: projectSlug,
+        issue: issueId,
+        source: fallbackSource,
+        prUrl: checkedFallbackPrUrl,
+      });
+    }
 
     // Mark PR as "seen" (with eyes emoji) if not already marked.
     // This helps distinguish system-created PRs from human responses.
@@ -128,8 +215,6 @@ async function validatePrExistsForDeveloper(
     // merge conflicts, we must verify the PR is actually mergeable before accepting
     // work_finish(done). Without this check, developers can claim success after local
     // rebase but before pushing, causing infinite dispatch loops (#482).
-    const isConflictCycle = await isConflictResolutionCycle(workspaceDir, issueId);
-
     if (isConflictCycle && prStatus.mergeable === false) {
       await auditLog(workspaceDir, "work_finish_rejected", {
         project: projectSlug,
@@ -258,7 +343,16 @@ export function createWorkFinishTool(ctx: PluginContext) {
 
       // For developers marking work as done, validate that a PR exists
       if (role === "developer" && result === "done") {
-        await validatePrExistsForDeveloper(issueId, repoPath, provider, ctx.runCommand, workspaceDir, project.slug);
+        await validatePrExistsForDeveloper(
+          issueId,
+          repoPath,
+          provider,
+          ctx.runCommand,
+          workspaceDir,
+          project.slug,
+          project.baseBranch,
+          prUrl,
+        );
       }
 
       const completion = await executeCompletion({

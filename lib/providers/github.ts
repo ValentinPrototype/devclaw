@@ -186,6 +186,36 @@ export class GitHubProvider implements IssueProvider {
     } catch { return []; }
   }
 
+  private async resolveOpenPrState(prNumber: number, reviewDecision?: string | null): Promise<PrState> {
+    if (reviewDecision === "APPROVED") {
+      return PrState.APPROVED;
+    }
+    if (reviewDecision === "CHANGES_REQUESTED") {
+      return PrState.CHANGES_REQUESTED;
+    }
+
+    // No branch protection → reviewDecision may be empty. Check individual reviews.
+    const hasChangesRequested = await this.hasChangesRequestedReview(prNumber);
+    if (hasChangesRequested) {
+      return PrState.CHANGES_REQUESTED;
+    }
+
+    // Check for unacknowledged COMMENTED reviews (feedback without formal "Request changes")
+    const hasReviewFeedback = await this.hasUnacknowledgedReviews(prNumber);
+    if (hasReviewFeedback) {
+      return PrState.HAS_COMMENTS;
+    }
+
+    const hasComments = await this.hasConversationComments(prNumber);
+    return hasComments ? PrState.HAS_COMMENTS : PrState.OPEN;
+  }
+
+  private parseMergeableState(mergeable?: string | null): boolean | undefined {
+    return mergeable === "CONFLICTING" ? false
+      : mergeable === "MERGEABLE" ? true
+      : undefined;
+  }
+
   async ensureLabel(name: string, color: string): Promise<void> {
     await this.gh(["label", "create", name, "--color", color.replace(/^#/, ""), "--force"]);
   }
@@ -301,34 +331,8 @@ export class GitHubProvider implements IssueProvider {
     const open = await this.findPrsForIssue<OpenPr>(issueId, "open", "title,body,headRefName,url,number,reviewDecision,mergeable");
     if (open.length > 0) {
       const pr = open[0];
-      let state: PrState;
-      if (pr.reviewDecision === "APPROVED") {
-        state = PrState.APPROVED;
-      } else if (pr.reviewDecision === "CHANGES_REQUESTED") {
-        state = PrState.CHANGES_REQUESTED;
-      } else {
-        // No branch protection → reviewDecision may be empty. Check individual reviews.
-        const hasChangesRequested = await this.hasChangesRequestedReview(pr.number);
-        if (hasChangesRequested) {
-          state = PrState.CHANGES_REQUESTED;
-        } else {
-          // Check for unacknowledged COMMENTED reviews (feedback without formal "Request changes")
-          const hasReviewFeedback = await this.hasUnacknowledgedReviews(pr.number);
-          if (hasReviewFeedback) {
-            state = PrState.HAS_COMMENTS;
-          } else {
-            // Fall through to conversation comment detection
-            const hasComments = await this.hasConversationComments(pr.number);
-            state = hasComments ? PrState.HAS_COMMENTS : PrState.OPEN;
-          }
-        }
-      }
-
-      // Conflict detection: "CONFLICTING" means merge conflicts, "UNKNOWN" means still computing
-      const mergeable = pr.mergeable === "CONFLICTING" ? false
-        : pr.mergeable === "MERGEABLE" ? true
-        : undefined; // UNKNOWN or missing — don't assume
-
+      const state = await this.resolveOpenPrState(pr.number, pr.reviewDecision);
+      const mergeable = this.parseMergeableState(pr.mergeable);
       return { state, url: pr.url, title: pr.title, sourceBranch: pr.headRefName, mergeable };
     }
     // Check merged PRs — also fetch reviewDecision to detect approved-then-merged vs self-merged.
@@ -347,6 +351,54 @@ export class GitHubProvider implements IssueProvider {
       return { state: PrState.CLOSED, url: closedPr.url, title: closedPr.title, sourceBranch: closedPr.headRefName };
     }
     return { state: PrState.CLOSED, url: null };
+  }
+
+  async getPrStatusByUrl(prUrl: string): Promise<PrStatus | null> {
+    const match = prUrl.match(/\/pull\/(\d+)(?:$|[/?#])/);
+    if (!match) return null;
+
+    try {
+      type ViewPr = {
+        number: number;
+        title: string;
+        url: string;
+        headRefName: string;
+        reviewDecision: string | null;
+        mergeable: string | null;
+        state: string;
+      };
+
+      const raw = await this.gh([
+        "pr", "view", match[1]!,
+        "--json", "number,title,url,headRefName,reviewDecision,mergeable,state",
+      ]);
+      const pr = JSON.parse(raw) as ViewPr;
+      if (!pr?.url) return null;
+
+      if (pr.state === "OPEN") {
+        const state = await this.resolveOpenPrState(pr.number, pr.reviewDecision);
+        return {
+          state,
+          url: pr.url,
+          title: pr.title,
+          sourceBranch: pr.headRefName,
+          mergeable: this.parseMergeableState(pr.mergeable),
+        };
+      }
+
+      if (pr.state === "MERGED") {
+        const state = pr.reviewDecision === "APPROVED" ? PrState.APPROVED : PrState.MERGED;
+        return { state, url: pr.url, title: pr.title, sourceBranch: pr.headRefName };
+      }
+
+      if (pr.state === "CLOSED") {
+        return { state: PrState.CLOSED, url: pr.url, title: pr.title, sourceBranch: pr.headRefName };
+      }
+    } catch {
+      return null;
+    }
+
+    return null;
   }
 
   /**

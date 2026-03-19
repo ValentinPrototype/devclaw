@@ -11,21 +11,16 @@
  */
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert";
-import { mkdtemp, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, writeFile, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { rmdir } from "node:fs/promises";
+import { rm } from "node:fs/promises";
+import { TestProvider } from "../../testing/test-provider.js";
+import { resolveDeveloperPrStatus } from "./work-finish.js";
 
 // Helper to create a mock audit log with a merge_conflict transition
 async function createMockAuditLog(workspaceDir: string, issueId: number, hasMergeConflict: boolean): Promise<void> {
-  const logDir = join(workspaceDir, "devclaw", "log");
-  
-  // Ensure directory exists
-  try {
-    await writeFile(join(workspaceDir, "devclaw", "placeholder"), "");
-  } catch {
-    // ignore
-  }
+  await mkdir(join(workspaceDir, "devclaw", "log"), { recursive: true });
   
   const auditPath = join(workspaceDir, "devclaw", "log", "audit.log");
   const entries = [];
@@ -64,6 +59,34 @@ async function createMockAuditLog(workspaceDir: string, issueId: number, hasMerg
   await writeFile(auditPath, content);
 }
 
+async function createFeedbackAuditLog(
+  workspaceDir: string,
+  issueId: number,
+  opts: { reason: string; prUrl?: string },
+): Promise<void> {
+  await mkdir(join(workspaceDir, "devclaw", "log"), { recursive: true });
+  const auditPath = join(workspaceDir, "devclaw", "log", "audit.log");
+  const entries = [
+    JSON.stringify({
+      timestamp: "2026-03-01T10:00:00Z",
+      event: "issue_created",
+      issueId,
+      project: "devclaw",
+    }),
+    JSON.stringify({
+      timestamp: "2026-03-01T10:15:00Z",
+      event: "review_transition",
+      issueId,
+      from: "To Review",
+      to: "To Improve",
+      reason: opts.reason,
+      prUrl: opts.prUrl,
+      project: "devclaw",
+    }),
+  ];
+  await writeFile(auditPath, entries.join("\n") + "\n");
+}
+
 describe("work_finish: PR validation and conflict resolution", () => {
   let tempDir: string;
 
@@ -74,7 +97,7 @@ describe("work_finish: PR validation and conflict resolution", () => {
   after(async () => {
     // Clean up
     try {
-      await rmdir(tempDir, { recursive: true });
+      await rm(tempDir, { recursive: true, force: true });
     } catch {
       // ignore
     }
@@ -220,6 +243,51 @@ describe("work_finish: PR validation and conflict resolution", () => {
     });
   });
 
+  describe("resolveDeveloperPrStatus", () => {
+    it("falls back to the review-cycle PR URL from audit when issue lookup misses", async () => {
+      const issueId = 130;
+      const prUrl = "https://github.com/test/repo/pull/133";
+      await createFeedbackAuditLog(tempDir, issueId, { reason: "changes_requested", prUrl });
+
+      const provider = new TestProvider();
+      provider.setPrStatus(issueId, { state: "closed", url: null });
+      provider.setPrStatusByUrl(prUrl, {
+        state: "open",
+        url: prUrl,
+        sourceBranch: "feature/130-replace-hardcoded-colors",
+        mergeable: true,
+      });
+
+      const resolved = await resolveDeveloperPrStatus(issueId, provider, tempDir);
+
+      assert.strictEqual(resolved.prStatus.url, prUrl);
+      assert.strictEqual(resolved.fallbackSource, "audit_feedback");
+      assert.strictEqual(resolved.checkedFallbackPrUrl, prUrl);
+      assert.strictEqual(resolved.isConflictCycle, false);
+    });
+
+    it("prefers an explicit prUrl over the audit fallback", async () => {
+      const issueId = 131;
+      const auditPrUrl = "https://github.com/test/repo/pull/200";
+      const explicitPrUrl = "https://github.com/test/repo/pull/201";
+      await createFeedbackAuditLog(tempDir, issueId, { reason: "changes_requested", prUrl: auditPrUrl });
+
+      const provider = new TestProvider();
+      provider.setPrStatus(issueId, { state: "closed", url: null });
+      provider.setPrStatusByUrl(explicitPrUrl, {
+        state: "open",
+        url: explicitPrUrl,
+        sourceBranch: "feature/131-explicit-pr",
+      });
+
+      const resolved = await resolveDeveloperPrStatus(issueId, provider, tempDir, explicitPrUrl);
+
+      assert.strictEqual(resolved.prStatus.url, explicitPrUrl);
+      assert.strictEqual(resolved.fallbackSource, "explicit");
+      assert.strictEqual(resolved.checkedFallbackPrUrl, explicitPrUrl);
+    });
+  });
+
   describe("catch block precedence", () => {
     it("should correctly check for validation error type", () => {
       // Test that our error checking logic is correct
@@ -243,7 +311,7 @@ describe("work_finish: PR validation and conflict resolution", () => {
 
     it("should handle non-Error exceptions gracefully", () => {
       // Test that non-Error objects don't cause issues
-      const notAnError = "some string";
+      const notAnError: unknown = "some string";
       
       const shouldRethrow = 
         notAnError instanceof Error && 

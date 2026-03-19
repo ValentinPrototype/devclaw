@@ -218,6 +218,7 @@ export async function reviewPass(opts: {
                       from: state.label,
                       to: failedState.label,
                       reason: "merge_failed",
+                      prUrl: status.url,
                     });
                     transitions++;
                   }

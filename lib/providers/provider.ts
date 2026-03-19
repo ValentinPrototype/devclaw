@@ -86,6 +86,12 @@ export interface IssueProvider {
   reopenIssue(issueId: number): Promise<void>;
   getMergedMRUrl(issueId: number): Promise<string | null>;
   getPrStatus(issueId: number): Promise<PrStatus>;
+  /**
+   * Look up a specific PR/MR by its URL.
+   * Used as a fallback when issue-to-PR linking is missing but the workflow
+   * already knows which review-cycle PR should be updated.
+   */
+  getPrStatusByUrl(prUrl: string): Promise<PrStatus | null>;
   mergePr(issueId: number): Promise<void>;
   getPrDiff(issueId: number): Promise<string | null>;
   /** Get review comments on the PR linked to an issue. */
