@@ -58,6 +58,26 @@ export class GitLabProvider implements IssueProvider {
     } catch { return []; }
   }
 
+  private async buildOpenMrStatus(mr: GitLabMR): Promise<PrStatus> {
+    const approved = await this.isMrApproved(mr.iid);
+
+    let state: PrState;
+    if (approved) {
+      state = PrState.APPROVED;
+    } else {
+      const hasUnresolved = await this.hasUnresolvedDiscussions(mr.iid);
+      if (hasUnresolved) {
+        state = PrState.CHANGES_REQUESTED;
+      } else {
+        const hasComments = await this.hasConversationComments(mr.iid);
+        state = hasComments ? PrState.HAS_COMMENTS : PrState.OPEN;
+      }
+    }
+
+    const mergeable = await this.isMrMergeable(mr.iid);
+    return { state, url: mr.web_url, title: mr.title, sourceBranch: mr.source_branch, mergeable };
+  }
+
   async ensureLabel(name: string, color: string): Promise<void> {
     try {
       // Update-first: always set the color on existing labels
@@ -196,27 +216,7 @@ export class GitLabProvider implements IssueProvider {
     // Check open MRs first
     const open = mrs.find((mr) => mr.state === "opened");
     if (open) {
-      const approved = await this.isMrApproved(open.iid);
-
-      // Detect changes requested via unresolved discussion threads
-      let state: PrState;
-      if (approved) {
-        state = PrState.APPROVED;
-      } else {
-        const hasUnresolved = await this.hasUnresolvedDiscussions(open.iid);
-        if (hasUnresolved) {
-          state = PrState.CHANGES_REQUESTED;
-        } else {
-          // Check for top-level conversation comments from non-author users
-          const hasComments = await this.hasConversationComments(open.iid);
-          state = hasComments ? PrState.HAS_COMMENTS : PrState.OPEN;
-        }
-      }
-
-      // Detect merge conflicts
-      const mergeable = await this.isMrMergeable(open.iid);
-
-      return { state, url: open.web_url, title: open.title, sourceBranch: open.source_branch, mergeable };
+      return this.buildOpenMrStatus(open);
     }
     // Check merged MRs
     const merged = mrs.find((mr) => mr.state === "merged");
@@ -226,6 +226,32 @@ export class GitLabProvider implements IssueProvider {
     const closed = mrs.find((mr) => mr.state === "closed");
     if (closed) return { state: PrState.CLOSED, url: closed.web_url, title: closed.title, sourceBranch: closed.source_branch };
     return { state: PrState.CLOSED, url: null };
+  }
+
+  async getPrStatusByUrl(prUrl: string): Promise<PrStatus | null> {
+    const match = prUrl.match(/\/merge_requests\/(\d+)(?:$|[/?#])/);
+    if (!match) return null;
+
+    try {
+      const raw = await this.glab(["api", `projects/:id/merge_requests/${match[1]}`]);
+      if (!raw) return null;
+      const mr = JSON.parse(raw) as GitLabMR;
+      if (!mr?.web_url) return null;
+
+      if (mr.state === "opened") {
+        return this.buildOpenMrStatus(mr);
+      }
+      if (mr.state === "merged") {
+        return { state: PrState.MERGED, url: mr.web_url, title: mr.title, sourceBranch: mr.source_branch };
+      }
+      if (mr.state === "closed") {
+        return { state: PrState.CLOSED, url: mr.web_url, title: mr.title, sourceBranch: mr.source_branch };
+      }
+    } catch {
+      return null;
+    }
+
+    return null;
   }
 
   /** Check if an MR has unresolved discussion threads (proxy for changes requested). */

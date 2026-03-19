@@ -44,6 +44,7 @@ export type ProviderCall =
   | { method: "reopenIssue"; args: { issueId: number } }
   | { method: "getMergedMRUrl"; args: { issueId: number } }
   | { method: "getPrStatus"; args: { issueId: number } }
+  | { method: "getPrStatusByUrl"; args: { prUrl: string } }
   | { method: "mergePr"; args: { issueId: number } }
   | { method: "getPrDiff"; args: { issueId: number } }
   | { method: "getPrReviewComments"; args: { issueId: number } }
@@ -64,6 +65,8 @@ export class TestProvider implements IssueProvider {
   labels = new Map<string, string>();
   /** PR status overrides per issue. Default: { state: "closed", url: null }. */
   prStatuses = new Map<number, PrStatus>();
+  /** PR status overrides keyed directly by PR URL. */
+  prStatusesByUrl = new Map<string, PrStatus>();
   /** Merged MR URLs per issue. */
   mergedMrUrls = new Map<number, string>();
   /** Issue IDs where mergePr should fail (simulates merge conflicts). */
@@ -105,6 +108,11 @@ export class TestProvider implements IssueProvider {
     this.prStatuses.set(issueId, status);
   }
 
+  /** Set PR status by URL (used for fallback lookup tests). */
+  setPrStatusByUrl(prUrl: string, status: PrStatus): void {
+    this.prStatusesByUrl.set(prUrl, status);
+  }
+
   /** Get calls filtered by method name. */
   callsTo<M extends ProviderCall["method"]>(
     method: M,
@@ -123,6 +131,7 @@ export class TestProvider implements IssueProvider {
     this.comments.clear();
     this.labels.clear();
     this.prStatuses.clear();
+    this.prStatusesByUrl.clear();
     this.mergedMrUrls.clear();
     this.mergePrFailures.clear();
     this.prDiffs.clear();
@@ -246,6 +255,13 @@ export class TestProvider implements IssueProvider {
   async getPrStatus(issueId: number): Promise<PrStatus> {
     this.calls.push({ method: "getPrStatus", args: { issueId } });
     return this.prStatuses.get(issueId) ?? { state: "closed", url: null };
+  }
+
+  async getPrStatusByUrl(prUrl: string): Promise<PrStatus | null> {
+    this.calls.push({ method: "getPrStatusByUrl", args: { prUrl } });
+    return this.prStatusesByUrl.get(prUrl)
+      ?? [...this.prStatuses.values()].find((status) => status.url === prUrl)
+      ?? null;
   }
 
   async mergePr(issueId: number): Promise<void> {
